@@ -134,6 +134,18 @@ func GetSiswa(db *gorm.DB, logger *zap.SugaredLogger) gin.HandlerFunc {
 		// Build query
 		query := db.Model(&models.Siswa{})
 
+		// Role-based filtering for Wali Kelas
+		role, _ := c.Get("role")
+		if role != nil && role.(string) == "wali_kelas" {
+			nip, _ := c.Get("nip")
+			if nip != nil {
+				var guru models.Guru
+				if err := db.Where("nip = ?", nip.(string)).First(&guru).Error; err == nil {
+					query = query.Where("kelas = ?", guru.KelasWali)
+				}
+			}
+		}
+
 		// Apply search filter (NIS or nama_siswa)
 		if filter.Search != "" {
 			searchTerm := "%" + strings.ToLower(filter.Search) + "%"
@@ -585,22 +597,70 @@ func CreateAbsensi(db *gorm.DB, logger *zap.SugaredLogger) gin.HandlerFunc {
 			return
 		}
 
-		absensi := models.Absensi{
-			NIS:       nis,
-			IDJadwal:  req.IDJadwal,
-			Tanggal:   tanggal,
-			Status:    req.Status,
-			Deskripsi: req.Deskripsi,
+		// Role-based restrictions for Wali Kelas
+		role, _ := c.Get("role")
+		userRole := role.(string)
+
+		if userRole == "wali_kelas" {
+			nip, _ := c.Get("nip")
+			userNip := nip.(string)
+
+			var guru models.Guru
+			if err := db.Where("nip = ?", userNip).First(&guru).Error; err != nil {
+				logger.Errorw("Failed to fetch guru info for wali_kelas", "nip", userNip, "error", err.Error())
+				c.JSON(http.StatusInternalServerError, gin.H{"message": "Gagal memverifikasi data wali kelas"})
+				return
+			}
+
+			if guru.KelasWali != siswa.Kelas {
+				logger.Warnw("Wali kelas attempted to edit student outside their class",
+					"guru_nip", userNip,
+					"guru_kelas", guru.KelasWali,
+					"siswa_nis", nis,
+					"siswa_kelas", siswa.Kelas,
+				)
+				c.JSON(http.StatusForbidden, gin.H{
+					"message": "Anda hanya diperbolehkan mengelola absensi untuk kelas " + guru.KelasWali,
+				})
+				return
+			}
 		}
 
-		if err := db.Create(&absensi).Error; err != nil {
-			logger.Errorw("Failed to create absensi",
-				"nis", nis,
-				"error", err.Error(),
-			)
-			c.JSON(http.StatusInternalServerError, gin.H{
-				"message": "Gagal membuat absensi",
-			})
+		// Check if an absensi record already exists for this day/jadwal
+		var absensi models.Absensi
+		var existingAbsensi models.Absensi
+		err = db.Where("nis = ? AND id_jadwal = ? AND tanggal = ?", nis, req.IDJadwal, tanggal).First(&existingAbsensi).Error
+
+		if err == nil {
+			// Record exists. Update it if the new status is izin/sakit (or any valid status override)
+			// User specifically mentioned converting 'alpha' to 'izin/sakit'
+			existingAbsensi.Status = req.Status
+			existingAbsensi.Deskripsi = req.Deskripsi
+
+			if err := db.Save(&existingAbsensi).Error; err != nil {
+				logger.Errorw("Failed to update existing absensi", "nis", nis, "error", err.Error())
+				c.JSON(http.StatusInternalServerError, gin.H{"message": "Gagal memperbarui data absensi"})
+				return
+			}
+			absensi = existingAbsensi
+		} else if err == gorm.ErrRecordNotFound {
+			// Record doesn't exist, create new one
+			absensi = models.Absensi{
+				NIS:       nis,
+				IDJadwal:  req.IDJadwal,
+				Tanggal:   tanggal,
+				Status:    req.Status,
+				Deskripsi: req.Deskripsi,
+			}
+
+			if err := db.Create(&absensi).Error; err != nil {
+				logger.Errorw("Failed to create absensi", "nis", nis, "error", err.Error())
+				c.JSON(http.StatusInternalServerError, gin.H{"message": "Gagal membuat absensi"})
+				return
+			}
+		} else {
+			logger.Errorw("Failed to check existing absensi", "nis", nis, "error", err.Error())
+			c.JSON(http.StatusInternalServerError, gin.H{"message": "Gagal mengecek data absensi"})
 			return
 		}
 
@@ -611,7 +671,7 @@ func CreateAbsensi(db *gorm.DB, logger *zap.SugaredLogger) gin.HandlerFunc {
 			}
 		}
 
-		logger.Infow("Absensi created successfully",
+		logger.Infow("Absensi processed successfully",
 			"nis", nis,
 			"id_absen", absensi.IDAbsen,
 			"status", absensi.Status,
