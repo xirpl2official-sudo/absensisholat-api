@@ -335,76 +335,101 @@ func Login(db *gorm.DB, logger *zap.SugaredLogger) gin.HandlerFunc {
 
 		// 2. Try finding Staff
 		var staffAccount models.UserStaff
-		if err := db.First(&staffAccount, "username = ?", loginID).Error; err == nil {
-			// Validate password
-			if !utils.CheckPasswordHash(input.Password, staffAccount.Password) {
-				logger.Warnw("Invalid password for staff", "username", loginID)
-				c.JSON(http.StatusUnauthorized, gin.H{"message": "Password salah"})
-				return
-			}
+		var loginByUsername bool = true
 
-			// Fetch Staff-specific profile details
-			var name string
-			var nip string
-			if staffAccount.Role == "admin" {
-				var adm models.Admin
-				if err := db.First(&adm, "id_staff = ?", staffAccount.IDStaff).Error; err == nil {
-					name = adm.NamaAdmin
+		// First, try finding by username
+		err := db.First(&staffAccount, "username = ?", loginID).Error
+		if err != nil {
+			// If not found by username, try finding by NIP for teachers/wali kelas
+			var guru models.Guru
+			if err := db.Where("nip = ?", loginID).First(&guru).Error; err == nil {
+				// Found guru/wali kelas by NIP, now get their staff account
+				if err := db.First(&staffAccount, "id_staff = ?", guru.IDStaff).Error; err == nil {
+					loginByUsername = false
+					logger.Infow("Staff login attempt by NIP", "nip", loginID, "id_staff", guru.IDStaff)
+				} else {
+					// Guru found but no staff account
+					logger.Warnw("Guru found but no staff account", "nip", loginID, "id_staff", guru.IDStaff)
+					c.JSON(http.StatusUnauthorized, gin.H{"message": "NIS/Username belum terdaftar atau belum membuat akun"})
+					return
 				}
-			} else if staffAccount.Role == "guru" || staffAccount.Role == "wali_kelas" {
-				var gru models.Guru
-				if err := db.First(&gru, "id_staff = ?", staffAccount.IDStaff).Error; err == nil {
-					name = gru.NamaGuru
-					nip = gru.NIP
-				}
-			}
-
-			// Generate Token
-			accessToken, err := utils.GenerateTokenWithNIP(staffAccount.Username, "", staffAccount.Role, name, nip)
-			if err != nil {
-				logger.Errorw("Staff token generation failed", "error", err.Error())
-				c.JSON(http.StatusInternalServerError, gin.H{"message": "Gagal membuat token akses staff"})
+			} else {
+				// Not found by username or NIP
+				logger.Warnw("Account not found", "identifier", loginID)
+				c.JSON(http.StatusUnauthorized, gin.H{
+					"message": "NIS/Username belum terdaftar atau belum membuat akun",
+				})
 				return
 			}
+		} else {
+			logger.Infow("Staff login attempt by username", "username", loginID)
+		}
 
-			refreshToken, terr := utils.GenerateRefreshToken(staffAccount.Username, staffAccount.Role)
-			if terr != nil {
-				logger.Errorw("Failed to generate refresh token", "error", terr.Error())
-				c.JSON(http.StatusInternalServerError, gin.H{"message": "Gagal membuat sesi login"})
-				return
-			}
-
-			// Store/Update Refresh Token
-			db.Create(&models.RefreshToken{
-				UserID:    staffAccount.Username,
-				Token:     refreshToken,
-				Role:      staffAccount.Role,
-				ExpiresAt: time.Now().Add(7 * 24 * time.Hour),
-			})
-
-			logger.Infow("Staff login successful", "username", loginID, "role", staffAccount.Role)
-
-			c.JSON(http.StatusOK, gin.H{
-				"message": "Login berhasil",
-				"data": gin.H{
-					"token":         accessToken,
-					"refresh_token": refreshToken,
-					"role":          staffAccount.Role,
-					"username":      staffAccount.Username,
-					"nis":           staffAccount.Username, // Mobile app compatibility for identifier
-					"nama":          name,                  // Matches Android 'nama'
-					"name":          name,                  // Compatibility
-					"nip":           nip,
-					"is_staff":      true,
-				},
-			})
+		// Validate password
+		if !utils.CheckPasswordHash(input.Password, staffAccount.Password) {
+			logger.Warnw("Invalid password for staff", "username", staffAccount.Username, "login_method", map[bool]string{true: "username", false: "nip"}[loginByUsername])
+			c.JSON(http.StatusUnauthorized, gin.H{"message": "Password salah"})
 			return
 		}
 
-		// 3. Not Found in either table
-		logger.Warnw("Account not found", "identifier", loginID)
-		c.JSON(http.StatusUnauthorized, gin.H{
-			"message": "NIS/Username belum terdaftar atau belum membuat akun",
+		// Fetch Staff-specific profile details
+		var name string
+		var nip string
+		if staffAccount.Role == "admin" {
+			var adm models.Admin
+			if err := db.First(&adm, "id_staff = ?", staffAccount.IDStaff).Error; err == nil {
+				name = adm.NamaAdmin
+			}
+		} else if staffAccount.Role == "guru" || staffAccount.Role == "wali_kelas" {
+			var gru models.Guru
+			if err := db.First(&gru, "id_staff = ?", staffAccount.IDStaff).Error; err == nil {
+				name = gru.NamaGuru
+				nip = gru.NIP
+			}
+		}
+
+		// Generate Token
+		accessToken, err := utils.GenerateTokenWithNIP(staffAccount.Username, "", staffAccount.Role, name, nip)
+		if err != nil {
+			logger.Errorw("Staff token generation failed", "error", err.Error())
+			c.JSON(http.StatusInternalServerError, gin.H{"message": "Gagal membuat token akses staff"})
+			return
+		}
+
+		refreshToken, terr := utils.GenerateRefreshToken(staffAccount.Username, staffAccount.Role)
+		if terr != nil {
+			logger.Errorw("Failed to generate refresh token", "error", terr.Error())
+			c.JSON(http.StatusInternalServerError, gin.H{"message": "Gagal membuat sesi login"})
+			return
+		}
+
+		// Store/Update Refresh Token
+		db.Create(&models.RefreshToken{
+			UserID:    staffAccount.Username,
+			Token:     refreshToken,
+			Role:      staffAccount.Role,
+			ExpiresAt: time.Now().Add(7 * 24 * time.Hour),
+		})
+
+		loginMethod := "username"
+		if !loginByUsername {
+			loginMethod = "nip"
+		}
+		logger.Infow("Staff login successful", "username", staffAccount.Username, "role", staffAccount.Role, "login_method", loginMethod)
+
+		c.JSON(http.StatusOK, gin.H{
+			"message": "Login berhasil",
+			"data": gin.H{
+				"token":         accessToken,
+				"refresh_token": refreshToken,
+				"role":          staffAccount.Role,
+				"username":      staffAccount.Username,
+				"nis":           staffAccount.Username, // Mobile app compatibility for identifier
+				"nama":          name,                  // Matches Android 'nama'
+				"name":          name,                  // Compatibility
+				"nip":           nip,
+				"is_staff":      true,
+			},
 		})
 	}
 }
